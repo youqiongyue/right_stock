@@ -39,6 +39,10 @@ COMMISSION           = 0.001
 SLIPPAGE             = 0.002
 CSI300_SYMBOL        = "000300"
 
+# 新增常量：用于动态股票选择
+ITICK_TOKEN          = "6e22921dceb0492ea60d21c43c4833a2c00794ec321e49f498340d728645ae2c"
+LOOKBACK_DAYS        = 60
+
 DEFAULT_SYMBOLS = [
     "SH688981", "SH688111", "SH688036", "SH688599", "SH688012",
     "SH688396", "SH688180", "SH688169", "SH688009", "SH688008",
@@ -622,17 +626,30 @@ def main():
     parser.add_argument("--no-market-filter", action="store_true", help="关闭大盘过滤")
     parser.add_argument("--compare",        action="store_true", help="同时跑无ETF过滤版做对比")
     parser.add_argument("--output",         default="backtest_result_v3.json")
+    # 新增参数：动态股票选择
+    parser.add_argument("--dynamic-stocks", action="store_true", help="使用new.py策略动态选择股票（默认关闭）")
+    parser.add_argument("--min-price", type=float, default=5.0, help="动态选择时的最低股价")
+    parser.add_argument("--min-amount", type=float, default=30000000, help="动态选择时的最低成交额")
+    parser.add_argument("--max-stocks", type=int, default=600, help="动态选择时的最大股票数量")
     args = parser.parse_args()
 
     etf_filter    = not args.no_etf_filter
     market_filter = not args.no_market_filter
     symbols       = args.symbols or DEFAULT_SYMBOLS
 
+    # 如果启用了动态股票选择，则调用new.py的策略逻辑
+    if args.dynamic_stocks:
+        print("使用动态股票选择策略（基于new.py逻辑）...")
+        symbols = get_dynamic_stock_universe(args.min_price, args.min_amount, args.max_stocks)
+        if not symbols:
+            print("动态股票选择失败，回退到默认股票池")
+            symbols = DEFAULT_SYMBOLS
+    
     print(f"\n{'='*60}")
     print(f"  右侧趋势策略回测 v3（行业ETF过滤版）")
     print(f"{'='*60}")
     print(f"  回测区间:   {args.start} ~ {args.end}")
-    print(f"  股票池:     {len(symbols)} 只")
+    print(f"  股票池:     {len(symbols)} 只{'（动态选择）' if args.dynamic_stocks else '（固定列表）'}")
     print(f"  ETF过滤:    {'开启' + ('【严格模式：全多头排列】' if args.etf_strict else '【标准：收盘>MA20 且 5日涨>0】') if etf_filter else '关闭'}")
     print(f"  大盘过滤:   {'开启' if market_filter else '关闭'}")
     print(f"  ATR止损:    {args.atr_mult}×ATR14  移动止盈: >{args.trailing_tp*100:.0f}%")
@@ -740,6 +757,75 @@ def main():
     print(f"📊 可视化：打开 backtest_dashboard.html 上传该文件")
     print(f"{'='*60}\n")
 
+
+# 新增函数：动态获取股票池
+def _infer_cn_region_by_code(code6: str) -> str:
+    """根据6位股票代码推断交易所前缀（SH/SZ/BJ）"""
+    c = str(code6).strip().zfill(6)
+    if c.startswith(("60", "68", "69")):
+        return "SH"
+    if c.startswith(("00", "30", "20")):
+        return "SZ"
+    if c.startswith(("43", "83", "87", "88", "92")) or c[0] in {"4", "8", "9"}:
+        return "BJ"
+    return "SZ"
+
+
+def get_dynamic_stock_universe(min_price: float = 5.0, min_amount: float = 30000000, max_stocks: int = 600) -> list[str]:
+    """
+    动态获取股票池：与 new.py 相同的全市场初筛方式。
+    使用 AkShare 全市场快照（ak.stock_zh_a_spot_em），按成交额从高到低排序，
+    过滤掉价格过低和成交额过小的股票，取前 max_stocks 只。
+
+    返回：股票symbol列表，如['SH600000', 'SZ000001', ...]
+    """
+    print("动态股票选择：开始获取全市场股票数据（ak.stock_zh_a_spot_em）...")
+    try:
+        df = ak.stock_zh_a_spot_em()
+    except Exception as e:
+        print(f"动态股票选择：全市场快照获取失败: {e}")
+        return []
+
+    if df is None or df.empty:
+        print("动态股票选择：全市场快照返回空")
+        return []
+
+    # 兼容不同 AkShare 版本字段
+    code_col   = next((c for c in ["代码", "code", "证券代码"] if c in df.columns), None)
+    name_col   = next((c for c in ["名称", "name", "证券简称"] if c in df.columns), None)
+    price_col  = next((c for c in ["最新价", "最新", "price"] if c in df.columns), None)
+    amount_col = next((c for c in ["成交额", "amount", "turnover"] if c in df.columns), None)
+
+    if not all([code_col, price_col, amount_col]):
+        print(f"动态股票选择：字段缺失 code={code_col}, price={price_col}, amount={amount_col}")
+        return []
+
+    base = df[[code_col, price_col, amount_col]].copy()
+    base[price_col]  = pd.to_numeric(base[price_col],  errors="coerce")
+    base[amount_col] = pd.to_numeric(base[amount_col], errors="coerce")
+    base.dropna(subset=[price_col, amount_col], inplace=True)
+
+    before = len(base)
+    base = base[(base[price_col] >= float(min_price)) & (base[amount_col] >= float(min_amount))]
+    after = len(base)
+    print(f"动态股票选择：全市场初筛 {before} -> {after}（价格>={min_price}, 成交额>={min_amount:,.0f}）")
+
+    # 按成交额从高到低排序，优先流动性好的票
+    base = base.sort_values(amount_col, ascending=False)
+
+    # 截断到 max_stocks
+    if max_stocks and max_stocks > 0:
+        base = base.head(max_stocks)
+
+    # 转换为 symbol 格式（SH/SZ + 6位代码）
+    selected_symbols = []
+    for _, row in base.iterrows():
+        code6  = str(row[code_col]).strip().zfill(6)
+        region = _infer_cn_region_by_code(code6)
+        selected_symbols.append(f"{region}{code6}")
+
+    print(f"动态股票选择完成：共 {len(selected_symbols)} 只（全市场按成交额排序）")
+    return selected_symbols
 
 if __name__ == "__main__":
     main()
