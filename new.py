@@ -168,57 +168,63 @@ def _infer_cn_region_by_code(code6: str) -> str:
     return "SZ"
 
 
+def get_index_components(index_codes: list = None) -> list:
+    """获取指定指数的成分股列表（沪深300 + 科创50）。
+
+    index_codes: 指数代码列表，默认 ['000300', '000688']
+    返回：list[dict]，每项包含 symbol / name
+    """
+    if index_codes is None:
+        index_codes = ["000300", "000688"]  # 沪深300 + 科创50
+
+    index_names = {"000300": "沪深300", "000688": "科创50"}
+
+    seen = set()
+    universe = []
+
+    for idx_code in index_codes:
+        try:
+            df = ak.index_stock_cons(symbol=idx_code)
+            # 列名：'品种代码' / '品种名称'
+            code_col = [c for c in df.columns if "代码" in c]
+            name_col = [c for c in df.columns if "名称" in c]
+            if not code_col:
+                print(f"指数 {idx_code} 返回数据列名异常：{df.columns.tolist()}")
+                continue
+            code_col = code_col[0]
+            name_col = name_col[0] if name_col else None
+
+            cnt = 0
+            for _, row in df.iterrows():
+                code6 = str(row[code_col]).strip().zfill(6)
+                name = str(row[name_col]).strip() if name_col else ""
+                if code6 in seen:
+                    continue
+                seen.add(code6)
+                region = _infer_cn_region_by_code(code6)
+                symbol = f"{region}{code6}"
+                universe.append({"symbol": symbol, "name": name})
+                cnt += 1
+
+            label = index_names.get(idx_code, idx_code)
+            print(f"{label}（{idx_code}）：获取到 {cnt} 只成分股")
+        except Exception as e:
+            print(f"获取指数 {idx_code} 成分股失败：{e}")
+
+    print(f"股票池合并去重后共 {len(universe)} 只（沪深300 + 科创50）")
+    return universe
+
+
 def get_a_share_universe_step1(min_price: float = MIN_PRICE, min_amount: float = MIN_VOLUME_AMOUNT):
-    """STEP 1：用 AkShare 全市场快照做初筛（价格/成交额），避免对全市场逐只打 iTick quote。
+    """STEP 1：获取股票池（沪深300 + 科创50 成分股）。
+
+    价格/成交额过滤将在获取 K 线后进行（从 K 线最后一根读取）。
 
     返回：list[dict]
     - symbol: iTick 兼容的 symbol（如 SH600000）
     - name: 股票名称
-    - price: 最新价
-    - amount: 成交额
     """
-
-    df = ak.stock_zh_a_spot_em()
-
-    # 兼容不同 AkShare 版本字段
-    code_col = next((c for c in ["代码", "code", "证券代码"] if c in df.columns), None)
-    name_col = next((c for c in ["名称", "name", "证券简称"] if c in df.columns), None)
-    price_col = next((c for c in ["最新价", "最新", "price"] if c in df.columns), None)
-    amount_col = next((c for c in ["成交额", "amount", "turnover"] if c in df.columns), None)
-
-    if not all([code_col, name_col, price_col, amount_col]):
-        raise RuntimeError(
-            f"AkShare 行情字段缺失：code={code_col}, name={name_col}, price={price_col}, amount={amount_col}"
-        )
-
-    base = df[[code_col, name_col, price_col, amount_col]].copy()
-    base[price_col] = pd.to_numeric(base[price_col], errors="coerce")
-    base[amount_col] = pd.to_numeric(base[amount_col], errors="coerce")
-    base.dropna(subset=[price_col, amount_col], inplace=True)
-
-    before = len(base)
-    base = base[(base[price_col] >= float(min_price)) & (base[amount_col] >= float(min_amount))]
-    after = len(base)
-
-    print(
-        f"STEP 1 初筛（全市场）：{before} -> {after}（价格>= {min_price}, 成交额>= {min_amount:,}）"
-    )
-
-    universe = []
-    for _, row in base.iterrows():
-        code6 = str(row[code_col]).strip().zfill(6)
-        region = _infer_cn_region_by_code(code6)
-        symbol = f"{region}{code6}"
-        universe.append(
-            {
-                "symbol": symbol,
-                "name": str(row[name_col]).strip(),
-                "price": float(row[price_col]),
-                "amount": float(row[amount_col]),
-            }
-        )
-
-    return universe
+    return get_index_components(["000300", "000688"])
 
 
 def filter_step1_by_quote(symbol, token):
@@ -274,7 +280,7 @@ def filter_step1_by_quote(symbol, token):
 
 
 def fetch_kline(symbol, token, days=LOOKBACK_DAYS):
-    """获取单个股票的日线K线数据"""
+    """获取单个股票的日线K线数据（含限速自适应）"""
     url = f"{ITICK_BASE_URL}/stock/kline"
 
     try:
@@ -285,7 +291,6 @@ def fetch_kline(symbol, token, days=LOOKBACK_DAYS):
             "token": token,
         }
 
-        # 按 iTick 文档：kType=8 为日线；用 limit 控制条数
         params = {
             "region": region,
             "code": code,
@@ -293,8 +298,28 @@ def fetch_kline(symbol, token, days=LOOKBACK_DAYS):
             "limit": int(days),
         }
 
-        resp = requests.get(url, params=params, headers=headers, timeout=10)
-        resp.raise_for_status()
+        # 遇到 429 自动退避重试（最多 3 次）
+        for attempt in range(3):
+            resp = requests.get(url, params=params, headers=headers, timeout=10)
+
+            # 读取限速 header，remaining<=1 时提前等待
+            remaining = int(resp.headers.get("x-ratelimit-remaining", 99))
+            reset_sec = int(resp.headers.get("x-ratelimit-reset", 60))
+            if remaining <= 1 and resp.status_code != 429:
+                print(f"  [限速预警] remaining={remaining}，等待 {reset_sec}s 避免触发 429...")
+                time.sleep(reset_sec + 1)
+
+            if resp.status_code == 429:
+                wait_sec = reset_sec + 2 if reset_sec > 0 else 65
+                print(f"  [{symbol}] 触发限速(429)，等待 {wait_sec}s 后重试...")
+                time.sleep(wait_sec)
+                continue
+            resp.raise_for_status()
+            break
+        else:
+            print(f"  [{symbol}] 多次触发限速，跳过")
+            return pd.DataFrame()
+
         data = resp.json()
 
         if data.get("code") == 0:
@@ -303,7 +328,6 @@ def fetch_kline(symbol, token, days=LOOKBACK_DAYS):
             if df.empty:
                 return df
 
-            # 文档字段：t=timestamp(ms), c=close, o=open, h=high, l=low, v=volume, tu=amount
             df.rename(
                 columns={
                     "t": "date",
@@ -705,18 +729,35 @@ def main():
     if args.cache_kline:
         print(f"K线缓存：开启（dir={args.cache_dir}, date={cache_date}, offline={args.offline}）")
 
-    # 1. STEP 1：全市场初筛（价格/成交额）
+    # 1. STEP 1：获取股票池（沪深300 + 科创50）
     try:
         universe = get_a_share_universe_step1(min_price=args.min_price, min_amount=args.min_amount)
     except Exception as e:
-        print("获取全市场股票池失败:", e)
+        print("获取股票池失败:", e)
         return
     if not universe:
-        print("STEP 1 初筛后股票池为空，程序终止")
+        print("股票池为空，程序终止")
         return
 
-    # 默认按成交额降序，优先扫流动性更好的票
-    universe.sort(key=lambda x: x.get("amount", 0), reverse=True)
+    # 离线模式：从缓存读取成交额，按成交额降序排序
+    if args.offline:
+        cache_dir_date = os.path.join(args.cache_dir, cache_date)
+        amount_map = {}
+        if os.path.exists(cache_dir_date):
+            for item in universe:
+                sym = item["symbol"]
+                csv_path = os.path.join(cache_dir_date, f"{sym}.csv")
+                try:
+                    df_tmp = pd.read_csv(csv_path)
+                    amount_map[sym] = float(df_tmp.iloc[-1].get("amount", 0) or 0) if not df_tmp.empty else 0.0
+                except Exception:
+                    amount_map[sym] = 0.0
+        for item in universe:
+            item["amount"] = amount_map.get(item["symbol"], 0.0)
+        universe.sort(key=lambda x: x["amount"], reverse=True)
+        top5 = ["{0}({1:.1f}亿)".format(x['symbol'], x['amount']/1e8) for x in universe[:5]]
+        print(f"离线模式：按成交额排序完成，Top5：{top5}")
+
     if args.max_stocks and args.max_stocks > 0:
         universe = universe[: args.max_stocks]
         print(f"实际进入扫描股票数：{len(universe)}（max_stocks={args.max_stocks}）")
@@ -758,6 +799,13 @@ def main():
                 continue
 
         if df.empty:
+            continue
+
+        # 从 K 线最后一根做价格/成交额初筛（替代 AkShare 实时行情）
+        last_bar = df.iloc[-1]
+        last_price = float(last_bar.get("close", 0) or 0)
+        last_amount = float(last_bar.get("amount", 0) or 0)
+        if last_price < args.min_price or last_amount < args.min_amount:
             continue
 
         df = calculate_indicators(df)
